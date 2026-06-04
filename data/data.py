@@ -1,6 +1,7 @@
 import torch
 import pickle
 import os
+import io
 from torch.utils.data import RandomSampler, SequentialSampler, DataLoader, Dataset
 from torch.nn.utils.rnn import pad_sequence
 import numpy as np
@@ -61,8 +62,24 @@ def Multimodal_EHRs(args, mode, tokenizer = None):
         dataloader= DataLoader(dataset, sampler=sampler, batch_size=args.train_batch_size, collate_fn=DataPadding, drop_last=True)
     elif mode in ['val', 'test']:
         sampler = SequentialSampler(dataset)
-        dataloader= DataLoader(dataset, sampler=sampler, batch_size=args.eval_batch_size, collate_fn=DataPadding, drop_last=True)
+        dataloader= DataLoader(dataset, sampler=sampler, batch_size=args.eval_batch_size, collate_fn=DataPadding, drop_last=False)
+    else:
+        raise ValueError("mode should be one of: train, val, test")
     return dataset, dataloader
+
+def load_template_cpu_safe(path):
+    with open(path, 'rb') as f:
+        raw = f.read()
+    try:
+        obj = pickle.loads(raw)
+        return obj[0].cpu()
+    except Exception:
+        try:
+            obj = torch.load(io.BytesIO(raw), map_location=torch.device('cpu'), weights_only=False)
+            return obj[0].cpu()
+        except Exception:
+            print('Warning: failed to load template file on CPU, using zero template fallback:', path)
+            return torch.zeros((2, 768), dtype=torch.float32)
 
 class Loading_Data(Dataset):
     def __init__(self, args, mode, task_name, language_model, tokenizer, data = None):
@@ -82,9 +99,11 @@ class Loading_Data(Dataset):
         self.num_of_labtests = args.num_of_labtests
         
         if args.task == 'hospitalization':
-            self.templates = pickle.load(open('./config/task1_template.pkl', "rb"))[0].cpu()
+            self.templates = load_template_cpu_safe('./config/task1_template.pkl')
         elif args.task == 'critical_outcome':
-            self.templates = pickle.load(open('./config/task2_template.pkl', "rb"))[0].cpu()
+            self.templates = load_template_cpu_safe('./config/task2_template.pkl')
+        elif args.task == 'odir_paper':
+            self.templates = torch.zeros((2, 768), dtype=torch.float32)
         self.mode = mode
             
 
@@ -92,54 +111,76 @@ class Loading_Data(Dataset):
         data_details = self.data[idx]
         stay_id = data_details['stay_id']
 
-        '''Read triage variables'''
-        triage_variables = data_details['triage_variables']
+        if self.task_name == 'odir_paper':
+            demographics = data_details['demographics'].astype(float)
+            fundus = data_details['fundus'].astype(float)
+            keywords = data_details['keywords'].astype(float)
+            label = data_details['labels']
 
-        '''Read ICU metrics in lab test'''
-        if 'labtest' in data_details.keys():
-            labtest = data_details['labtest'].astype(float)
-        else:
-            labtest = np.zeros((12, self.dim_labtest))
-        
-        while labtest.shape[0] < self.num_of_labtests:
-            labtest = np.concatenate((labtest, np.zeros((1, self.dim_labtest))), axis=0)
-
-        if 'medications' in data_details.keys():
-            medication = data_details['medications']
-            medication_one_hot_tensors = np.zeros((medication.shape[0], self.dim_medications))
-            for j in range(medication.shape[0]):
-                med_index = medication[j, 0]
-                medication_one_hot_tensors[j, med_index] = 1
-        else:
-            medication_one_hot_tensors = np.zeros((1, self.dim_medications))
-
-        if 'diagnoses' in data_details.keys():
-            diagnoses = data_details['diagnoses']
-            diagnoses_one_hot_tensors = np.zeros((diagnoses.shape[0], self.dim_diagnoses))
-            for j in range(diagnoses.shape[0]):
-                diag_index = diagnoses[j, 0]
-                diagnoses_one_hot_tensors[j, diag_index] = 1
-        else:
+            triage_variables = demographics
+            text_representations = np.expand_dims(fundus, axis=0)
+            medication_one_hot_tensors = np.expand_dims(keywords, axis=0)
+            labtest = np.zeros((self.num_of_labtests, self.dim_labtest))
             diagnoses_one_hot_tensors = np.zeros((1, self.dim_diagnoses))
-
-        '''
-        Read text representations from the frozen pretrained language model.
-        '''
-        if 'notes' in data_details.keys():
-            text_representations = data_details['notes'].squeeze()
         else:
-            text_representations = np.zeros((5, self.dim_notes))        
-        
-        '''Read labels'''
-        if self.task_name == 'hospitalization':
-            label = data_details['task1_hospitalization_label']
-        elif self.task_name == 'inhospital_mortality':
-            label = data_details['task2_inhospital_mortality_label']
-        elif self.task_name == 'icu_transfer_12h':
-            label = data_details['task3_icu_transfer_12h_label']
-        elif self.task_name == 'critical_outcome':
-            label = data_details['task4_outcome_critical_label']
-        
+            '''Read triage variables'''
+            triage_variables = data_details['triage_variables']
+
+            '''Read ICU metrics in lab test'''
+            if 'labtest' in data_details.keys():
+                labtest = data_details['labtest'].astype(float)
+            else:
+                labtest = np.zeros((12, self.dim_labtest))
+            
+            while labtest.shape[0] < self.num_of_labtests:
+                labtest = np.concatenate((labtest, np.zeros((1, self.dim_labtest))), axis=0)
+
+            if 'medications' in data_details.keys():
+                medication = data_details['medications']
+                if medication.ndim > 1 and medication.shape[1] > 1:
+                    medication_one_hot_tensors = medication
+                else:
+                    medication_one_hot_tensors = np.zeros((max(1, medication.shape[0]), self.dim_medications))
+                    for j in range(medication.shape[0]):
+                        med_index = int(medication[j, 0])
+                        if 0 <= med_index < self.dim_medications:
+                            medication_one_hot_tensors[j, med_index] = 1
+            else:
+                medication_one_hot_tensors = np.zeros((1, self.dim_medications))
+
+            if 'diagnoses' in data_details.keys():
+                diagnoses = data_details['diagnoses']
+                if diagnoses.ndim > 1 and diagnoses.shape[1] > 1:
+                    diagnoses_one_hot_tensors = diagnoses
+                else:
+                    diagnoses_one_hot_tensors = np.zeros((max(1, diagnoses.shape[0]), self.dim_diagnoses))
+                    for j in range(diagnoses.shape[0]):
+                        diag_index = int(diagnoses[j, 0])
+                        if 0 <= diag_index < self.dim_diagnoses:
+                            diagnoses_one_hot_tensors[j, diag_index] = 1
+            else:
+                diagnoses_one_hot_tensors = np.zeros((1, self.dim_diagnoses))
+
+            if 'notes' in data_details.keys():
+                text_representations = data_details['notes'].squeeze()
+            elif 'text_representations' in data_details.keys():
+                text_representations = data_details['text_representations'].squeeze()
+            else:
+                text_representations = np.zeros((5, self.dim_notes))
+
+            '''Read labels'''
+            if self.task_name == 'hospitalization':
+                label = data_details['task1_hospitalization_label']
+            elif self.task_name == 'inhospital_mortality':
+                label = data_details['task2_inhospital_mortality_label']
+            elif self.task_name == 'icu_transfer_12h':
+                label = data_details['task3_icu_transfer_12h_label']
+            elif self.task_name == 'critical_outcome':
+                label = data_details['task4_outcome_critical_label']
+            elif self.task_name == 'odir_paper':
+                label = data_details['labels']
+            else:
+                raise ValueError("Unsupported task_name: {}".format(self.task_name))
 
         task_template = self.templates[:2]
         mask_template = self.templates[1]
@@ -149,7 +190,13 @@ class Loading_Data(Dataset):
         labtest = torch.tensor(labtest, dtype=torch.float)
         medication_one_hot_tensors = torch.tensor(medication_one_hot_tensors, dtype=torch.float)
         diagnoses_one_hot_tensors = torch.tensor(diagnoses_one_hot_tensors, dtype=torch.float)
-        label = torch.tensor(label, dtype=torch.long)
+        text_representations = torch.tensor(text_representations, dtype=torch.float)
+        task_template = task_template.clone().detach().to(dtype=torch.float)
+        mask_template = mask_template.clone().detach().to(dtype=torch.float)
+        if self.task_name == 'odir_paper':
+            label = torch.tensor(label, dtype=torch.float)
+        else:
+            label = torch.tensor(label, dtype=torch.long)
 
         return {'stay_id': stay_id, 
                 'triage_variables': triage_variables, 

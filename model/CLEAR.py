@@ -354,9 +354,10 @@ class CLEAR(nn.Module):
                                                                                     attn_mask=False
                                                                                     )
         
+        disparity_output_size = output_dim if self.task == 'odir_paper' else 2
         self.classifier_disparity = Classifier(input_size = 1280, \
                                        hidden_size = 512, \
-                                       output_size = 2, \
+                                       output_size = disparity_output_size, \
                                        dropout = 0.1)
         
         self.FFN = PositionwiseFeedForward(128, 256, self.dropout)
@@ -580,4 +581,4 @@ class CLEAR(nn.Module):
 
         
         else:
-            return torch.nn.functional.softmax(output,dim=-1)
+            return torch.sigmoid(output)
